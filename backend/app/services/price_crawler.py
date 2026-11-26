@@ -2,12 +2,16 @@
 
 数据链路位置：采集执行层，把站点目录、频控规则和代理线路组合成可运行的爬取任务，
 产出的页面样本写入样本库供解析层消费。
+
+与调度计划共用 `crawl_state` 的轮次口径：每笔页面交付都先用采集状态数据校验
+是否仍具资格，再回传 收录 / 暂挂 / 需要恢复 给调度。
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services import crawl_state as cs
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -23,6 +27,29 @@ class PriceCrawlerService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     # ---- 业务扩展：爬取调度与样本产出 ----
+
+    def _plan_for(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        plans = cs.plans_for_task(str(entry.get("任务名称", "")))
+        return plans[0] if plans else None
+
+    def _resolve_page(
+        self,
+        entry: dict[str, Any],
+        round_id: str | None,
+        page_no: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+        plan = self._plan_for(entry)
+        if plan is None:
+            return None, None, f"任务 {entry.get('任务名称', '')} 未关联调度计划，无法按轮次交付"
+        rnd = cs.get_round(plan, round_id) if round_id else cs.get_round(plan)
+        if rnd is None:
+            return plan, None, f"任务 {entry.get('任务名称', '')} 没有可用的执行轮次"
+        if page_no is None:
+            return plan, rnd, None
+        page = cs.page_by_no(rnd, page_no)
+        if page is None:
+            return plan, rnd, f"轮次 {rnd.get('round_id')} 中没有页面 {page_no}"
+        return plan, rnd, None
 
     def start_task(self, entry_id: int) -> dict[str, Any]:
         """启动爬取任务，校验站点有效性与频控状态后进入运行中。"""
@@ -41,6 +68,12 @@ class PriceCrawlerService(BaseModuleService):
         )
         if limit is None:
             return {"ok": False, "message": "目标站点缺少生效频控规则，拒绝启动"}
+        plan = self._plan_for(entry)
+        if plan is not None and plan.get("paused"):
+            return {
+                "ok": False,
+                "message": f"计划已暂停（轮次 {plan.get('paused_round_id')}），不能单独启动任务",
+            }
         entry["status"] = "运行中"
         entry["pending"] = True
         return {
@@ -86,9 +119,14 @@ class PriceCrawlerService(BaseModuleService):
         entry = store.find(self.MODULE, entry_id)
         if entry is None or entry.get("status") != "运行中":
             return {"ok": False, "message": "任务不在运行中，不能产出样本"}
+        plan = self._plan_for(entry)
+        if plan is not None and plan.get("paused"):
+            return {"ok": False, "message": "计划已暂停，不能产出新样本"}
         rows = store.rows("sample_store")
         base_id = max((int(r.get("id", 0)) for r in rows), default=0)
         batch = f"task-{entry_id}-{datetime.now(timezone.utc).timestamp():.0f}"
+        rnd = cs.get_round(plan) if plan else None
+        round_id = rnd.get("round_id") if rnd else ""
         for offset, page in enumerate(pages, start=1):
             rows.append({
                 "id": base_id + offset,
@@ -100,8 +138,119 @@ class PriceCrawlerService(BaseModuleService):
                 "status": "已保存",
                 "pending": True,
                 "abnormal": False,
+                "round_id": round_id,
+                "plan_id": plan.get("id") if plan else None,
             })
         return {"ok": True, "message": "样本已写入样本库", "batch": batch, "count": len(pages)}
+
+    def deliver_page(
+        self,
+        entry_id: int,
+        page_no: str | None = None,
+        round_id: str | None = None,
+    ) -> dict[str, Any]:
+        """用采集状态数据校验每笔页面交付，并回传结果给调度。
+
+        round_id 缺省时取任务关联计划的当前轮次；未指定 page_no 时逐页校验。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": f"{self.ENTITY} {entry_id} 不存在"}
+        plan, rnd, error = self._resolve_page(entry, round_id, page_no)
+        if error:
+            return {"ok": False, "message": error}
+        assert plan is not None and rnd is not None
+        pages = [cs.page_by_no(rnd, page_no)] if page_no else cs.pages_of(rnd)
+        results: list[dict[str, Any]] = []
+        for page in pages:
+            eligibility = cs.page_eligibility(plan, rnd, page)
+            outcome = eligibility["state"]
+            delivered = outcome == cs.ELIGIBLE and cs.page_is_stored(page)
+            if outcome == cs.ELIGIBLE:
+                handoff = "已交付下游" if delivered else "可交付，等待交接"
+            elif outcome == cs.HELD:
+                handoff = "暂挂，等待回执齐全后交接"
+            else:
+                handoff = "需要续跑旧轮后才能交付"
+            results.append({
+                **eligibility,
+                "task": entry.get("任务名称", ""),
+                "outcome": outcome,
+                "delivered": delivered,
+                "handoff": handoff,
+            })
+        summary = cs.summarize_states(results)
+        check = {
+            "checked_at": cs.now_iso(),
+            "task": entry.get("任务名称", ""),
+            "plan_id": plan.get("id"),
+            "round_id": rnd.get("round_id"),
+            "source": "crawl_state",
+            "results": results,
+            "summary": summary,
+        }
+        rnd.setdefault("delivery_checks", []).append(check)
+        cs.record_round_event(
+            plan, rnd, "任务交付校验",
+            page_no=page_no,
+            note=f"收录 {summary[cs.ELIGIBLE]} / 暂挂 {summary[cs.HELD]} / 需要恢复 {summary[cs.NEEDS_RESUME]}",
+        )
+        return {
+            "ok": True,
+            "message": "页面交付资格已校验并回传调度",
+            **check,
+            # 旧轮可做的操作按实际接收顺序返回，供任务详情直接展示。
+            "page_operations": cs.ordered_page_operations(plan, rnd),
+        }
+
+    def round_operations(
+        self,
+        entry_id: int,
+        round_id: str | None = None,
+    ) -> dict[str, Any]:
+        """回到原申请时，按实际接收顺序给出该轮每页可做的操作。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": f"{self.ENTITY} {entry_id} 不存在"}
+        plan, rnd, error = self._resolve_page(entry, round_id, None)
+        if error:
+            return {"ok": False, "message": error}
+        assert plan is not None and rnd is not None
+        operations = cs.ordered_page_operations(plan, rnd)
+        return {
+            "ok": True,
+            "message": f"轮次 {rnd.get('round_id')} 的操作已按实际接收顺序返回",
+            "task": entry.get("任务名称", ""),
+            "round_id": rnd.get("round_id"),
+            "round_status": rnd.get("status"),
+            "operations": operations,
+            "summary": cs.summarize_states(cs.round_eligibility(plan, rnd)),
+        }
+
+    def page_eligibility(
+        self,
+        entry_id: int,
+        page_no: str,
+        round_id: str | None = None,
+    ) -> dict[str, Any]:
+        """单页交付资格查询，供调度与前端随时核对。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": f"{self.ENTITY} {entry_id} 不存在"}
+        plan, rnd, error = self._resolve_page(entry, round_id, page_no)
+        if error:
+            return {"ok": False, "message": error}
+        assert plan is not None and rnd is not None
+        page = cs.page_by_no(rnd, page_no)
+        assert page is not None
+        eligibility = cs.page_eligibility(plan, rnd, page)
+        return {
+            "ok": True,
+            "message": f"页面 {page_no} 当前交付资格：{eligibility['state']}",
+            "task": entry.get("任务名称", ""),
+            "round_id": rnd.get("round_id"),
+            **eligibility,
+        }
 
     def bind_proxy_route(self, entry_id: int) -> dict[str, Any]:
         """为任务选择可用代理线路并记录绑定。"""

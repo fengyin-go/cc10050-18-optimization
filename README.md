@@ -79,5 +79,44 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 采集轮次与暂停 / 续跑
+
+`采集调度计划` 的每次调度都会开启一个执行轮次（`round_id`，形如 `1-R1`）。
+页面签收、回执、样本和完成回执都挂在轮次上，跨模块的判断统一走
+`backend/app/services/crawl_state.py`：
+
+- 暂停只冻结调度入口：已签收页面留在原轮次、样本不回收，在途页面记为暂停冲突；
+- 暂停期间拒绝新建轮次，调度队列请求新轮会明确返回「计划已暂停」；
+- 续跑只继续被暂停的旧轮，页面不会迁移到新轮；
+- 完成回执按 `round_id` 归档，旧轮与恢复后的新轮互不串号；
+- 页面交付资格只有三种：`收录`、`暂挂`、`需要恢复`，由价格爬取任务用采集状态数据校验后回传调度。
+
+页面入口：`/crawl_schedule`（轮次工作台）、`/price_crawler`（交付资格校验）。
+
+主要接口：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/crawl_schedule/{id}/rounds` | 轮次列表（按开启顺序） |
+| GET | `/api/crawl_schedule/{id}/rounds/{round_id}` | 轮次详情、页面操作顺序、交付资格 |
+| GET | `/api/crawl_schedule/{id}/rounds/{round_id}/pages/{page_no}` | 页面签收详情与刷新提示 |
+| GET | `/api/crawl_schedule/{id}/pause-receipt` | 暂停回执（签收页面、在途冲突、样本核对） |
+| GET | `/api/crawl_schedule/{id}/completion-receipt?round_id=` | 按轮次回查完成回执 |
+| GET | `/api/crawl_schedule/{id}/page-locations?page_no=` | 页面归属轮次回查 |
+| POST | `/api/crawl_schedule/{id}/rounds` | 新建轮次（暂停时拒绝） |
+| POST | `/api/crawl_schedule/{id}/round-request` | 调度队列请求新轮（暂停时说明原因） |
+| POST | `/api/crawl_schedule/{id}/pause` \| `/confirm-pause` \| `/resume` | 暂停 / 确认暂停 / 续跑旧轮 |
+| POST | `/api/crawl_schedule/{id}/signoff` \| `/receipt` | 页面签收入库 / 登记回执 |
+| POST | `/api/crawl_schedule/{id}/complete` \| `/verify-deliveries` | 按轮回写完成回执 / 校验交付资格 |
+| POST | `/api/price_crawler/{id}/deliver-page` | 逐页校验交付资格并回传调度 |
+| GET | `/api/price_crawler/{id}/operations` | 按实际接收顺序给出可做操作 |
+
+后端回归测试：
+
+```bash
+cd backend && .venv/bin/python -m unittest discover -s tests -v
+```
+
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
